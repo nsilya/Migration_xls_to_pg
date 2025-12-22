@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: migration_postgres
+    environment:
+      POSTGRES_DB: migration_db
+      POSTGRES_USER: migrator
+      POSTGRES_PASSWORD: securepass123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - migration_net
+
+  rpa-bot:
+    build: .
+    container_name: rpa_migration_bot
+    depends_on:
+      - postgres
+    networks:
+      - migration_net
+    volumes:
+      - ./source_data.xlsx:/app/source_data.xlsx
+      - ./migration_errors.log:/app/migration_errors.log
+
+networks:
+  migration_net:
+    driver: bridge
