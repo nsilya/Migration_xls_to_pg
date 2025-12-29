@@ -1,146 +1,256 @@
 import pandas as pd
 import psycopg2
 from psycopg2 import OperationalError, Error as Psycopg2Error
+from psycopg2.extras import execute_values
 import logging
 import sys
 from dateutil.parser import parse
+from datetime import datetime, date
 import time
+import uuid
+import os
+import json
 
-# Настройка логирования
-logging.basicConfig(
-    filename='migration_errors.log',
-    level=logging.ERROR,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    encoding='utf-8'
-)
-
-# Конфигурация PostgreSQL
+# =============== НАСТРОЙКИ ===============
+EXCEL_FILE = 'source_data.xlsx'
+SHEET_NAME = 'Sheet1'
+STATE_FILE = 'migration_state.json'
 DB_CONFIG = {
     'host': 'localhost',
-    'port': '5432',
+    'port': '5433',
     'database': 'migration_db',
     'user': 'migrator',
     'password': 'securepass123'
 }
 
-EXCEL_FILE = 'source_data.xlsx'
-SHEET_NAME = 'Sheet1'
+# =============== ЛОГИРОВАНИЕ ===============
+logging.basicConfig(
+    filename='migration.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - run_id=%(run_id)s - %(message)s',
+    encoding='utf-8'
+)
 
 
-def is_valid_date(date_str):
-    """Проверяет корректность даты."""
-    if pd.isna(date_str):
-        return False
-    try:
-        parse(str(date_str))
+class RunIdFilter(logging.Filter):
+    def __init__(self, run_id):
+        super().__init__()
+        self.run_id = run_id
+
+    def filter(self, record):
+        record.run_id = self.run_id
         return True
-    except (ValueError, TypeError):
-        return False
 
 
-def connect_db():
+# =============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===============
+def parse_and_validate_date(date_str):
+    """
+    Пытается распарсить дату и валидирует её.
+    Возвращает валидный date или None если дата некорректна.
+    """
+    if pd.isna(date_str):
+        return None
+
+    # Преобразуем в строку для обработки
+    date_str_clean = str(date_str).strip()
+
+    # Пропускаем пустые строки
+    if not date_str_clean:
+        return None
+
+    try:
+        # Пробуем распарсить
+        parsed_date = parse(date_str_clean, dayfirst=True, yearfirst=True)
+        date_obj = parsed_date.date()
+
+        # Дополнительная валидация
+        # 1. Проверка на реалистичные годы
+        if date_obj.year < 1900 or date_obj.year > datetime.now().year + 1:
+            return None
+
+        # 2. Проверка на корректность даты (особенно для февраля 29)
+        try:
+            # Пробуем создать date объект снова для проверки
+            date(date_obj.year, date_obj.month, date_obj.day)
+        except ValueError:
+            return None
+
+        return date_obj
+    except (ValueError, TypeError, OverflowError) as e:
+        # Ловим все возможные ошибки парсинга
+        return None
+
+
+def validate_full_name(name_str):
+    """Валидирует ФИО."""
+    if pd.isna(name_str):
+        return ''
+
+    name = str(name_str).strip()
+    # Базовая проверка: не должно быть пустым или состоять только из пробелов
+    if not name:
+        return ''
+
+    # Убираем лишние пробелы
+    return ' '.join(name.split())
+
+
+def connect_db(max_attempts=10, delay=2):
     """Подключается к PostgreSQL с повторными попытками."""
-    for attempt in range(10):
+    for attempt in range(max_attempts):
         try:
             return psycopg2.connect(**DB_CONFIG)
         except OperationalError as e:
             logging.error(f"Не удалось подключиться к PostgreSQL (попытка {attempt + 1}): {e}")
-            time.sleep(2)
+            time.sleep(delay)
     logging.critical("Превышено максимальное число попыток подключения к PostgreSQL")
     sys.exit(1)
 
 
-def ensure_processed_column(df):
-    """Гарантирует наличие колонки 'processed'."""
-    if 'processed' not in df.columns:
-        df['processed'] = False
-    return df
+def load_or_create_state():
+    """Загружает состояние обработки из файла или создаёт пустое."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, IOError) as e:
+            logging.error(f"Ошибка чтения файла состояния: {e}. Создаём новый.")
+    return set()
+
+
+def save_state(processed_ids):
+    """Сохраняет множество обработанных ID."""
+    try:
+        # Конвертируем numpy.int64 в обычный int
+        ids_list = [int(id_val) for id_val in processed_ids]
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(ids_list, f)
+    except IOError as e:
+        logging.error(f"Ошибка сохранения состояния: {e}")
 
 
 def create_target_table(conn):
-    """Создаёт таблицу в PostgreSQL, если она не существует."""
+    """Создаёт целевую таблицу, если не существует."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS migrated_data (
                 id INTEGER PRIMARY KEY,
-                full_name TEXT,
-                birth_date DATE,
-                processed_at TIMESTAMP DEFAULT NOW()
+                full_name TEXT NOT NULL,
+                birth_date DATE NOT NULL, -- <-- ТЕПЕРЬ NOT NULL
+                processed_at TIMESTAMP DEFAULT NOW(),
+                CONSTRAINT valid_date_range CHECK (
+                    birth_date >= '1900-01-01' AND birth_date <= CURRENT_DATE + INTERVAL '1 year'
+                )
             )
         """)
         conn.commit()
 
 
+# =============== ОСНОВНАЯ ЛОГИКА ===============
 def main():
-    print(" Запуск RPA-бота миграции по методу Баданова и Тугой (2025)...")
+    # Генерируем уникальный ID запуска для трассировки
+    run_id = str(uuid.uuid4())[:8]
+    logging.getLogger().addFilter(RunIdFilter(run_id))
+    logging.info("=== ЗАПУСК МИГРАЦИИ ===")
 
-    # Чтение Excel
+    print(f" Запуск миграции (run_id={run_id})...")
+
+    # 1. Загрузка и предварительная валидация данных
     try:
         df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME, dtype={'id': 'Int64'})
-        df = ensure_processed_column(df)
-        print(f"✅ Загружено {len(df)} строк из {EXCEL_FILE}")
-    except (FileNotFoundError, ValueError) as e:
-        logging.error(f"Ошибка чтения Excel: {e}")
+        logging.info(f"Загружено {len(df)} строк из {EXCEL_FILE}")
+        print(f"✅ Загружено {len(df)} строк")
+    except (FileNotFoundError, ValueError, Exception) as e:
+        logging.critical(f"Ошибка чтения Excel: {e}")
+        print(f"❌ Ошибка чтения файла Excel: {e}")
         return
 
-    # Подключение к БД и создание таблицы
+    # 2. Дедупликация по ID
+    initial_count = len(df)
+    df = df.drop_duplicates(subset=['id'], keep='first')
+    if len(df) < initial_count:
+        logging.info(f"Удалено {initial_count - len(df)} дублей по id")
+        print(f" Удалено {initial_count - len(df)} дублей")
+
+    # 3. Загрузка состояния
+    processed_ids = load_or_create_state()
+    logging.info(f"Уже обработано: {len(processed_ids)} записей")
+
+    # 4. Фильтрация уже обработанных строк
+    df_new = df[~df['id'].isin(processed_ids)].copy()
+    logging.info(f"Новых строк для обработки: {len(df_new)}")
+
+    if df_new.empty:
+        print("✅ Нет новых строк для обработки.")
+        return
+
+    # 5. Пакетная валидация данных в Pandas
+    df_new['full_name_valid'] = df_new['full_name'].apply(validate_full_name)
+    df_new['birth_date_parsed'] = df_new['birth_date'].apply(parse_and_validate_date)
+
+    # Фильтрация по валидным строкам
+    df_valid = df_new[
+        (df_new['full_name_valid'] != '') &
+        (df_new['birth_date_parsed'].notna())
+    ].copy()
+
+    # Подсчёт ошибок
+    invalid_count = len(df_new) - len(df_valid)
+    logging.info(f"Отфильтровано {invalid_count} невалидных строк")
+
+    if df_valid.empty:
+        print(f"❌ Нет валидных строк для вставки после фильтрации.")
+        return
+
+    # 6. Подготовка данных для вставки
+    records_to_insert = [
+        (int(row['id']), row['full_name_valid'], row['birth_date_parsed'])
+        for _, row in df_valid.iterrows()
+    ]
+
+    # 7. Подключение к БД
     conn = connect_db()
     create_target_table(conn)
 
-    total = 0
-    errors = 0
+    # 8. Пакетная вставка
+    try:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO migrated_data (id, full_name, birth_date)
+                VALUES %s
+                ON CONFLICT (id) DO NOTHING
+                """,
+                records_to_insert,
+                template=None,
+                page_size=100  # Пакеты по 100 строк
+            )
+            inserted_count = cur.rowcount
+        conn.commit()
+        logging.info(f"Вставлено {inserted_count} записей")
+    except Psycopg2Error as e:
+        logging.error(f"Ошибка вставки в БД: {e}")
+        print(f"❌ Ошибка вставки: {e}")
+        conn.rollback()
+        conn.close()
+        return
 
-    for idx, row in df.iterrows():
-        if row.get('processed') is True:
-            continue
+    # 9. Обновление состояния
+    new_processed_ids = set(df_valid['id'].values)
+    processed_ids.update(new_processed_ids)
+    save_state(processed_ids)
 
-        record_id = row['id']
-        if pd.isna(record_id):
-            logging.error("Пропущен ID (пустая строка)")
-            errors += 1
-            continue
-
-        full_name = str(row.get('full_name', '')) if not pd.isna(row.get('full_name')) else ''
-        birth_date_raw = row.get('birth_date')
-
-        # Валидация данных (оценка совместимости)
-        if not is_valid_date(birth_date_raw):
-            logging.error(f"Некорректная дата для ID {record_id}: '{birth_date_raw}'")
-            errors += 1
-            continue
-
-        # Трансформация даты
-        try:
-            birth_date = parse(str(birth_date_raw)).date()
-        except (ValueError, TypeError):
-            logging.error(f"Не удалось распарсить дату для ID {record_id}: '{birth_date_raw}'")
-            errors += 1
-            continue
-
-        # Запись в промежуточное хранилище
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO migrated_data (id, full_name, birth_date) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (id) DO NOTHING",
-                    (int(record_id), full_name, birth_date)
-                )
-                conn.commit()
-            total += 1
-            df.at[idx, 'processed'] = True
-        except Psycopg2Error as e:
-            logging.error(f"Ошибка PostgreSQL при записи ID {record_id}: {e}")
-            errors += 1
-
-    # Сохранение Excel с маркировкой
-    df.to_excel(EXCEL_FILE, sheet_name=SHEET_NAME, index=False)
     conn.close()
 
-    print(f"✅ Успешно обработано: {total} записей")
-    if errors:
-        print(f" Ошибок: {errors} — см. migration_errors.log")
-    else:
-        print("✅ Все записи обработаны без ошибок")
+    # 10. Отчёт
+    logging.info(f"Миграция завершена: вставлено={inserted_count}, ошибок={invalid_count}")
+    print(f"\n{'=' * 50}")
+    print(f"ОТЧЁТ О МИГРАЦИИ (run_id={run_id})")
+    print(f"{'=' * 50}")
+    print(f"✅ Успешно вставлено: {inserted_count} записей")
+    print(f"❌ Ошибок (невалидные): {invalid_count}")
+    print(f"📊 Всего строк в Excel: {len(df)}")
 
 
 if __name__ == "__main__":
